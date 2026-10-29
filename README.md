@@ -28,3 +28,7 @@ Create `tools/<name>/` with:
 - `config.example.env` if it needs settings: real values go in `~/.config/<name>/`, which isn't committed
 
 Then add a row to the table above.
+
+## License
+
+[MIT](LICENSE)
