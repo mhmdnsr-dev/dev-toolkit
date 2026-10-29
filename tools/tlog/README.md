@@ -33,6 +33,7 @@ tlog cer 4                             # log 4h on the Ceremonies (Meetings) tas
 tlog "login page" 3 "Form validation"  # match a task by title words (or task id / parent story id)
 tlog idle 2.5 "Helped a teammate"      # log on today's "<TLOG_NAME> - 29 Oct 2026" idle task (created if missing)
 tlog idle -1                           # undo a wrong log (negative hours)
+tlog support 2 "create the X flow doc" # log on a "Support to create the X flow doc" task (created if missing)
 tlog day                               # what I logged today vs the daily target
 tlog day 2026-10-30                    # ...or another day (current sprint tasks only)
 tlog stories [--json]                  # stories in the sprint with everyone's tasks
@@ -68,6 +69,7 @@ A plan file is a list of tasks (`type` defaults to Task, `activity` to `TLOG_DEV
 | New tasks | iteration = current sprint, area = `TLOG_AREA`, assigned to `TLOG_USER`, Original Estimate = Remaining Work = hours |
 | Logging | Completed Work += hours, Remaining Work -= hours (never below 0); comment goes to Discussion |
 | Idle time | one task per day, `<TLOG_NAME> - DD Mon YYYY`, Activity `TLOG_IDLE_ACTIVITY`, under the sprint story whose title contains `TLOG_IDLE_STORY`; Estimate = Completed = hours logged that day; optional extra field via `TLOG_IDLE_REASON_FIELD` |
+| Support work | a normal task titled `Support to <what>` (or `<what>` if it already starts with "Support") under the sprint story whose title contains `TLOG_SUPPORT_STORY`, Activity `TLOG_SUPPORT_ACTIVITY`; Estimate = Completed = hours; the same `<what>` again adds hours to it |
 | "Logged today" | sum of today's Completed Work changes in your tasks' history, so logs from the Azure DevOps web UI count too; hours count on the day they are saved |
 | Reminder | a systemd user timer (`~/.config/systemd/user/tlog-remind.{service,timer}`) runs `tlog remind check` and shows a desktop notification only if today is under target. Installing doesn't start it; once started it runs until `tlog remind stop` |
 

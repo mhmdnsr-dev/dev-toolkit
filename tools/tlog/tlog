@@ -13,6 +13,9 @@ Usage:
                                           negative hours undo a wrong log
                                           `tlog idle H` logs on today's "<Name> - DD Mon YYYY"
                                           task, creating it under the idle story if needed
+  tlog support <hours> "<what>"         log on a "Support to <what>" task under the sprint's
+                                          scrum story (TLOG_SUPPORT_STORY), creating it if needed;
+                                          the same <what> again adds hours to that task
   tlog day [YYYY-MM-DD]                 hours I logged on a day (default: today)
   tlog stories [--json]                 user stories in the current sprint + their tasks
   tlog create --from plan.json [--dry-run]
@@ -72,6 +75,8 @@ WORKDAYS = CFG.get("TLOG_WORKDAYS", "Mon..Fri")
 DEV_ACTIVITY = CFG.get("TLOG_DEV_ACTIVITY", "Development")
 IDLE_ACTIVITY = CFG.get("TLOG_IDLE_ACTIVITY", "Idle")
 IDLE_STORY = CFG.get("TLOG_IDLE_STORY", "Capacity")
+SUPPORT_STORY = CFG.get("TLOG_SUPPORT_STORY", "Scrum")
+SUPPORT_ACTIVITY = CFG.get("TLOG_SUPPORT_ACTIVITY") or DEV_ACTIVITY
 IDLE_REASON_FIELD = CFG.get("TLOG_IDLE_REASON_FIELD", "")
 IDLE_REASON = CFG.get("TLOG_IDLE_REASON", "")
 REMIND_UNIT = "tlog-remind"
@@ -258,36 +263,34 @@ def idle_description(day):
             "when needed (e.g., helping teammates, clarification or technical sync meetings).")
 
 
-def capacity_story(sprint, tasks):
-    for t in tasks:
-        if t["activity"] == IDLE_ACTIVITY and t["parent"]:
-            return t["parent"]
+def sprint_story(sprint, keyword, setting, tasks=(), activity=None):
+    """Id of the sprint story whose title contains `keyword` (or the parent of my tasks with `activity`)."""
+    if activity:
+        for t in tasks:
+            if t["activity"] == activity and t["parent"]:
+                return t["parent"]
     types = ",".join(f"'{t}'" for t in STORY_TYPES)
     rows = wiql(f"SELECT [{F_TITLE}] FROM WorkItems WHERE [System.IterationPath] = '{sprint['path']}' "
-                f"AND [{F_TYPE}] IN ({types}) AND [{F_TITLE}] CONTAINS '{IDLE_STORY}'")
+                f"AND [{F_TYPE}] IN ({types}) AND [{F_TITLE}] CONTAINS '{keyword}'")
     if not rows:
-        raise TlogError(f"No story with '{IDLE_STORY}' in its title in {sprint['name']} to put the idle task "
-                        f"under (set TLOG_IDLE_STORY).")
+        raise TlogError(f"No story with '{keyword}' in its title in {sprint['name']} (set {setting}).")
     return rows[0]["id"]
 
 
-def log_idle(hours, comment):
-    """Idle time goes on one task per day: '<TLOG_NAME> - 29 Oct 2026' (estimate = hours logged that day)."""
+def log_done_task(title, hours, comment, *, parent_of, activity, description, extra=()):
+    """Log hours on my sprint task with this title, creating it if needed (Estimate = Completed, Remaining 0)."""
     sprint = current_sprint()
     tasks = my_tasks(sprint)
-    today = date.today()
-    title = idle_title(today)
-    task = next((t for t in tasks if t["title"] == title), None)
+    task = next((t for t in tasks if t["title"].lower() == title.lower()), None)
 
     if task is None:
         if hours <= 0:
             raise TlogError(f"No '{title}' task yet, nothing to undo.")
-        parent = capacity_story(sprint, tasks)
-        fields = [f"{F_EST}={hours:g}", f"{F_DONE}={hours:g}", f"{F_REM}=0",
-                  f"{F_ACTIVITY}={IDLE_ACTIVITY}", *idle_reason_fields()]
+        parent = parent_of(sprint, tasks)
+        fields = [f"{F_EST}={hours:g}", f"{F_DONE}={hours:g}", f"{F_REM}=0", f"{F_ACTIVITY}={activity}", *extra]
         args = ["boards", "work-item", "create", "--type", "Task", "--title", title,
                 "--iteration", sprint["path"], "--area", AREA, "--assigned-to", USER,
-                "--description", idle_description(today), "--fields", *fields]
+                "--description", description, "--fields", *fields]
         if comment:
             args += ["--discussion", comment]
         created = az(*args)
@@ -300,19 +303,45 @@ def log_idle(hours, comment):
     done = task["done"] + hours
     if done < 0:
         raise TlogError(f"Completed work on {task['id']} would go below 0 (now {fmt(task['done'])}h).")
-    fields = [f"{F_EST}={done:g}", f"{F_DONE}={done:g}", f"{F_REM}=0", *idle_reason_fields()]
+    fields = [f"{F_EST}={done:g}", f"{F_DONE}={done:g}", f"{F_REM}=0", *extra]
     args = ["boards", "work-item", "update", "--id", str(task["id"]), "--fields", *fields]
     if comment:
         args += ["--discussion", comment]
     az(*args, project=False)
     sign = "+" if hours >= 0 else ""
-    print(f"✓ {task['id']} {title}: {sign}{fmt(hours)}h  →  {fmt(done)}h today"
+    print(f"✓ {task['id']} {task['title']}: {sign}{fmt(hours)}h  →  {fmt(done)}h total"
           + (f"\n  comment: {comment}" if comment else ""))
+
+
+def log_idle(hours, comment):
+    """Idle time goes on one task per day: '<TLOG_NAME> - 29 Oct 2026' (estimate = hours logged that day)."""
+    today = date.today()
+    log_done_task(
+        idle_title(today), hours, comment,
+        parent_of=lambda sprint, tasks: sprint_story(sprint, IDLE_STORY, "TLOG_IDLE_STORY", tasks, IDLE_ACTIVITY),
+        activity=IDLE_ACTIVITY, description=idle_description(today), extra=idle_reason_fields())
+
+
+def support_title(what):
+    return what if what.lower().startswith("support") else f"Support to {what}"
+
+
+def log_support(hours, what):
+    """Support work goes on a 'Support to <what>' task under the sprint's scrum/operations story."""
+    if not what:
+        raise TlogError('Say what the support was for: tlog support <hours> "create the X flow artifact"')
+    title = support_title(what)
+    log_done_task(
+        title, hours, None,
+        parent_of=lambda sprint, _tasks: sprint_story(sprint, SUPPORT_STORY, "TLOG_SUPPORT_STORY"),
+        activity=SUPPORT_ACTIVITY, description=f"{title}.")
 
 
 def cmd_log(key, hours, comment):
     if ALIASES.get(key.strip().lower()) == "idle":
         return log_idle(hours, comment)
+    if key.strip().lower() == "support":
+        return log_support(hours, comment)
     sprint = current_sprint()
     task = find_task(my_tasks(sprint), key)
     done = task["done"] + hours

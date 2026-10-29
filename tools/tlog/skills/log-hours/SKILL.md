@@ -15,6 +15,10 @@ Log hours with the `tlog` CLI (on PATH as `tlog`; settings in `~/.config/tlog/co
 2. Parse the request into entries of (task, hours, comment):
    - "ceremonies"/"meetings" → `cer`, "idle" → `idle`, otherwise the task id or title keywords.
      `idle` always logs on today's `<TLOG_NAME> - DD Mon YYYY` idle task and creates it if needed.
+   - Support work (helping teammates, creating docs/artifacts, support meetings) → `tlog support <hours> "<what>"`,
+     which logs on a `Support to <what>` task under the sprint's scrum/operations story (created if needed).
+     Prefer this over idle when the user says what the support was for. Reuse the exact same `<what>`
+     to add hours to an existing support task (check `tlog` for its title).
    - A comment is added only when the user gives one. Use the user's wording; drop anything they say
      not to include (e.g. links they asked you not to reference) and keep only the text.
    - The daily target is `TLOG_DAILY` (shown by `tlog day`). If the entries don't add up to it, tell the
