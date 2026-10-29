@@ -1,0 +1,10 @@
+# Personal settings never belong in the repo
+*.env
+!*.example.env
+.env*
+
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/

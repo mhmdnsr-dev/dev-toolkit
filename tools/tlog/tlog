@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""tlog - Azure DevOps sprint helper: plan sprint tasks, log daily hours, remind, summarize.
+
+Wraps the `az boards` CLI (uses your existing `az` login) and applies your
+team's conventions: area path, Activity, Idle reason, Completed/Remaining work.
+Settings live in ~/.config/tlog/config.env (see config.example.env).
+
+Usage:
+  tlog                                  my tasks in the current sprint (est / done / remaining)
+  tlog <task> <hours> [comment]         log hours on a task
+                                          <task> = task id, parent story id, alias
+                                          (cer / idle) or title keywords ("login page")
+                                          negative hours undo a wrong log
+                                          `tlog idle H` logs on today's "<Name> - DD Mon YYYY"
+                                          task, creating it under the idle story if needed
+  tlog day [YYYY-MM-DD]                 hours I logged on a day (default: today)
+  tlog stories [--json]                 user stories in the current sprint + their tasks
+  tlog create --from plan.json [--dry-run]
+  tlog create --parent ID --title T --hours H [--type Task|Meetings]
+              [--activity Development|Idle|...] [--desc TEXT] [--dry-run]
+  tlog sprint                           current sprint name and dates
+  tlog summary [--sprint prev|NAME] [--days] [--csv]
+                                        my hours per story (for timesheets);
+                                          --days adds a day-by-day breakdown,
+                                          --csv prints date,story,task,hours,comment rows
+  tlog remind start [HH:MM] [--days Mon..Fri]
+                                        daily desktop reminder if today < TLOG_DAILY hours (default 16:00,
+                                          days default to TLOG_WORKDAYS)
+  tlog remind stop | status | test      turn it off / show next run / send a sample notification
+
+Any setting can also be overridden by an environment variable of the same name.
+"""
+import argparse
+import csv
+import html
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
+from pathlib import Path
+
+CONFIG_FILE = Path(os.environ.get("TLOG_CONFIG", Path.home() / ".config" / "tlog" / "config.env"))
+
+
+def load_config():
+    """KEY=VALUE lines from the config file; TLOG_* environment variables win."""
+    cfg = {}
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                cfg[key.strip()] = value.strip().strip("\"'")
+    cfg.update({k: v for k, v in os.environ.items() if k.startswith("TLOG_")})
+    return cfg
+
+
+CFG = load_config()
+REQUIRED = ("TLOG_ORG", "TLOG_PROJECT", "TLOG_TEAM", "TLOG_AREA", "TLOG_USER")
+ORG = CFG.get("TLOG_ORG", "")
+PROJECT = CFG.get("TLOG_PROJECT", "")
+TEAM = CFG.get("TLOG_TEAM", "")
+AREA = CFG.get("TLOG_AREA", "")
+USER = CFG.get("TLOG_USER", "")
+NAME = CFG.get("TLOG_NAME") or USER.split("@")[0]
+DAILY = float(CFG.get("TLOG_DAILY", "8"))
+WORKDAYS = CFG.get("TLOG_WORKDAYS", "Mon..Fri")
+DEV_ACTIVITY = CFG.get("TLOG_DEV_ACTIVITY", "Development")
+IDLE_ACTIVITY = CFG.get("TLOG_IDLE_ACTIVITY", "Idle")
+IDLE_STORY = CFG.get("TLOG_IDLE_STORY", "Capacity")
+IDLE_REASON_FIELD = CFG.get("TLOG_IDLE_REASON_FIELD", "")
+IDLE_REASON = CFG.get("TLOG_IDLE_REASON", "")
+REMIND_UNIT = "tlog-remind"
+UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
+
+F_TYPE = "System.WorkItemType"
+F_TITLE = "System.Title"
+F_STATE = "System.State"
+F_PARENT = "System.Parent"
+F_ASSIGNED = "System.AssignedTo"
+F_EST = "Microsoft.VSTS.Scheduling.OriginalEstimate"
+F_DONE = "Microsoft.VSTS.Scheduling.CompletedWork"
+F_REM = "Microsoft.VSTS.Scheduling.RemainingWork"
+F_ACTIVITY = "Microsoft.VSTS.Common.Activity"
+F_SP = "Microsoft.VSTS.Scheduling.StoryPoints"
+
+STORY_TYPES = ("User Story", "Technical User Story")
+ALIASES = {
+    "cer": "ceremonies", "ceremony": "ceremonies", "ceremonies": "ceremonies",
+    "meeting": "ceremonies", "meetings": "ceremonies",
+    "idle": "idle",
+}
+
+
+class TlogError(Exception):
+    pass
+
+
+def check_config():
+    missing = [k for k in REQUIRED if not CFG.get(k)]
+    if missing:
+        raise TlogError(f"Missing settings: {', '.join(missing)}\n"
+                        f"Create {CONFIG_FILE} (copy config.example.env) and fill them in.")
+
+
+def idle_reason_fields():
+    """Extra required fields some processes put on idle tasks (optional, from config)."""
+    return [f"{IDLE_REASON_FIELD}={IDLE_REASON}"] if IDLE_REASON_FIELD and IDLE_REASON else []
+
+
+# ---------------------------------------------------------------- az helpers
+
+def az(*args, project=True):
+    check_config()
+    cmd = ["az", *args, "--org", ORG, "--detect", "false", "-o", "json"]
+    if project:
+        cmd += ["--project", PROJECT]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        errors = [l for l in res.stderr.splitlines() if not l.startswith("WARNING")]
+        raise TlogError("\n".join(errors) or f"az failed: {' '.join(args[:3])}")
+    return json.loads(res.stdout) if res.stdout.strip() else None
+
+
+def wiql(query):
+    return az("boards", "query", "--wiql", query) or []
+
+
+def sprint_info(it):
+    return {
+        "path": it["path"],
+        "name": it["path"].split("\\")[-1],
+        "start": (it["attributes"].get("startDate") or "")[:10],
+        "finish": (it["attributes"].get("finishDate") or "")[:10],
+    }
+
+
+def current_sprint():
+    its = az("boards", "iteration", "team", "list", "--team", TEAM, "--timeframe", "current")
+    if not its:
+        raise TlogError(f"No current sprint for team '{TEAM}'")
+    return sprint_info(its[0])
+
+
+def get_sprint(which=None):
+    """which: None/'current', 'prev'/'previous', or part of a sprint name."""
+    if not which or which == "current":
+        return current_sprint()
+    its = az("boards", "iteration", "team", "list", "--team", TEAM) or []
+    if which in ("prev", "previous", "last"):
+        past = [i for i in its if i["attributes"].get("timeFrame") == "past"]
+        if not past:
+            raise TlogError("No previous sprint found.")
+        return sprint_info(max(past, key=lambda i: i["attributes"].get("finishDate") or ""))
+    hits = [i for i in its if which.lower() in i["path"].split("\\")[-1].lower()]
+    if len(hits) != 1:
+        names = ", ".join(i["path"].split("\\")[-1] for i in its)
+        raise TlogError(f"'{which}' matches {len(hits)} sprints. Team sprints: {names}")
+    return sprint_info(hits[0])
+
+
+def num(v):
+    return float(v or 0)
+
+
+def fmt(v):
+    v = num(v)
+    return f"{v:g}"
+
+
+def assignee(f):
+    a = f.get(F_ASSIGNED)
+    if isinstance(a, dict):
+        return a.get("uniqueName", "")
+    return a or ""
+
+
+def titles_of(ids):
+    ids = sorted({i for i in ids if i})
+    if not ids:
+        return {}
+    rows = wiql(f"SELECT [{F_TITLE}] FROM WorkItems WHERE [System.Id] IN ({','.join(map(str, ids))})")
+    return {r["id"]: r["fields"].get(F_TITLE, "") for r in rows}
+
+
+def my_tasks(sprint):
+    types = ",".join(f"'{t}'" for t in STORY_TYPES + ("Feature", "Epic"))
+    rows = wiql(
+        f"SELECT [{F_TYPE}],[{F_TITLE}],[{F_STATE}],[{F_PARENT}],[{F_EST}],[{F_DONE}],[{F_REM}],[{F_ACTIVITY}] "
+        f"FROM WorkItems WHERE [System.IterationPath] = '{sprint['path']}' "
+        f"AND [{F_ASSIGNED}] = '{USER}' AND [{F_TYPE}] NOT IN ({types}) "
+        f"AND [{F_STATE}] <> 'Removed' ORDER BY [System.Id]"
+    )
+    parents = titles_of(r["fields"].get(F_PARENT) for r in rows)
+    tasks = []
+    for r in rows:
+        f = r["fields"]
+        tasks.append({
+            "id": r["id"], "type": f.get(F_TYPE), "title": f.get(F_TITLE, ""),
+            "state": f.get(F_STATE), "parent": f.get(F_PARENT),
+            "parent_title": parents.get(f.get(F_PARENT), ""),
+            "est": num(f.get(F_EST)), "done": num(f.get(F_DONE)), "rem": num(f.get(F_REM)),
+            "activity": f.get(F_ACTIVITY) or "",
+        })
+    return tasks
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_list(_args):
+    sprint = current_sprint()
+    tasks = my_tasks(sprint)
+    print(f"{sprint['name']}  ({sprint['start']} → {sprint['finish']})  ·  {USER}\n")
+    if not tasks:
+        print("No tasks assigned to you in this sprint.")
+        return
+    print(f"{'ID':>6}  {'Est':>5} {'Done':>5} {'Rem':>5}  {'Activity':<11} Task  [parent]")
+    for t in tasks:
+        print(f"{t['id']:>6}  {fmt(t['est']):>5} {fmt(t['done']):>5} {fmt(t['rem']):>5}  "
+              f"{(t['activity'] or t['type'])[:11]:<11} {t['title']}  [{t['parent']}]")
+    est = sum(t["est"] for t in tasks)
+    done = sum(t["done"] for t in tasks)
+    rem = sum(t["rem"] for t in tasks)
+    print(f"{'TOTAL':>6}  {fmt(est):>5} {fmt(done):>5} {fmt(rem):>5}")
+
+
+def find_task(tasks, key):
+    k = key.strip().lower()
+    if k.isdigit():
+        n = int(k)
+        hits = [t for t in tasks if t["id"] == n] or [t for t in tasks if t["parent"] == n]
+    elif ALIASES.get(k) == "ceremonies":
+        hits = [t for t in tasks if t["type"] == "Meetings" or "ceremon" in t["title"].lower()]
+    elif ALIASES.get(k) == "idle":
+        hits = [t for t in tasks if t["activity"] == IDLE_ACTIVITY or t["title"].lower() == "idle"]
+    else:
+        words = k.split()
+        hits = [t for t in tasks
+                if all(w in f"{t['title']} {t['parent_title']}".lower() for w in words)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise TlogError(f"No task matches '{key}'. Run `tlog` to see your tasks.")
+    lines = "\n".join(f"  {t['id']}  {t['title']}  [{t['parent']}]" for t in hits)
+    raise TlogError(f"'{key}' matches {len(hits)} tasks — use the id or more words:\n{lines}")
+
+
+def idle_title(day):
+    return f"{NAME} - {day:%d %b %Y}"
+
+
+def idle_description(day):
+    return (f"Unallocated capacity on {day:%d %b %Y}. Usually used for learning and for support meetings "
+            "when needed (e.g., helping teammates, clarification or technical sync meetings).")
+
+
+def capacity_story(sprint, tasks):
+    for t in tasks:
+        if t["activity"] == IDLE_ACTIVITY and t["parent"]:
+            return t["parent"]
+    types = ",".join(f"'{t}'" for t in STORY_TYPES)
+    rows = wiql(f"SELECT [{F_TITLE}] FROM WorkItems WHERE [System.IterationPath] = '{sprint['path']}' "
+                f"AND [{F_TYPE}] IN ({types}) AND [{F_TITLE}] CONTAINS '{IDLE_STORY}'")
+    if not rows:
+        raise TlogError(f"No story with '{IDLE_STORY}' in its title in {sprint['name']} to put the idle task "
+                        f"under (set TLOG_IDLE_STORY).")
+    return rows[0]["id"]
+
+
+def log_idle(hours, comment):
+    """Idle time goes on one task per day: '<TLOG_NAME> - 29 Oct 2026' (estimate = hours logged that day)."""
+    sprint = current_sprint()
+    tasks = my_tasks(sprint)
+    today = date.today()
+    title = idle_title(today)
+    task = next((t for t in tasks if t["title"] == title), None)
+
+    if task is None:
+        if hours <= 0:
+            raise TlogError(f"No '{title}' task yet, nothing to undo.")
+        parent = capacity_story(sprint, tasks)
+        fields = [f"{F_EST}={hours:g}", f"{F_DONE}={hours:g}", f"{F_REM}=0",
+                  f"{F_ACTIVITY}={IDLE_ACTIVITY}", *idle_reason_fields()]
+        args = ["boards", "work-item", "create", "--type", "Task", "--title", title,
+                "--iteration", sprint["path"], "--area", AREA, "--assigned-to", USER,
+                "--description", idle_description(today), "--fields", *fields]
+        if comment:
+            args += ["--discussion", comment]
+        created = az(*args)
+        az("boards", "work-item", "relation", "add", "--id", str(created["id"]),
+           "--relation-type", "parent", "--target-id", str(parent), project=False)
+        print(f"✓ created {created['id']} {title} [{parent}]: {fmt(hours)}h"
+              + (f"\n  comment: {comment}" if comment else ""))
+        return
+
+    done = task["done"] + hours
+    if done < 0:
+        raise TlogError(f"Completed work on {task['id']} would go below 0 (now {fmt(task['done'])}h).")
+    fields = [f"{F_EST}={done:g}", f"{F_DONE}={done:g}", f"{F_REM}=0", *idle_reason_fields()]
+    args = ["boards", "work-item", "update", "--id", str(task["id"]), "--fields", *fields]
+    if comment:
+        args += ["--discussion", comment]
+    az(*args, project=False)
+    sign = "+" if hours >= 0 else ""
+    print(f"✓ {task['id']} {title}: {sign}{fmt(hours)}h  →  {fmt(done)}h today"
+          + (f"\n  comment: {comment}" if comment else ""))
+
+
+def cmd_log(key, hours, comment):
+    if ALIASES.get(key.strip().lower()) == "idle":
+        return log_idle(hours, comment)
+    sprint = current_sprint()
+    task = find_task(my_tasks(sprint), key)
+    done = task["done"] + hours
+    rem = task["rem"] - hours
+    if done < 0:
+        raise TlogError(f"Completed work on {task['id']} would go below 0 (now {fmt(task['done'])}h).")
+    if rem < 0:
+        print(f"⚠ Remaining work on {task['id']} would be {fmt(rem)}h — setting it to 0. "
+              f"Consider raising the estimate.", file=sys.stderr)
+        rem = 0
+    fields = [f"{F_DONE}={done:g}", f"{F_REM}={rem:g}"]
+    if task["activity"] == IDLE_ACTIVITY:
+        fields += idle_reason_fields()
+    args = ["boards", "work-item", "update", "--id", str(task["id"]), "--fields", *fields]
+    if comment:
+        args += ["--discussion", comment]
+    az(*args, project=False)
+    sign = "+" if hours >= 0 else ""
+    print(f"✓ {task['id']} {task['title']}: {sign}{fmt(hours)}h  →  done {fmt(done)} / rem {fmt(rem)}"
+          + (f"\n  comment: {comment}" if comment else ""))
+
+
+def task_updates(task_id):
+    data = az("devops", "invoke", "--area", "wit", "--resource", "updates",
+              "--route-parameters", f"id={task_id}", "--api-version", "7.1", project=False)
+    return data.get("value", []) if data else []
+
+
+def strip_html(s):
+    return html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s or ""))).strip()
+
+
+def log_entries(tasks, day=None):
+    """Completed Work changes on the tasks as (when, task, hours, comment), oldest first."""
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        all_updates = list(ex.map(lambda t: task_updates(t["id"]), tasks))
+    entries = []
+    for t, updates in zip(tasks, all_updates):
+        for u in updates:
+            f = u.get("fields", {})
+            if F_DONE not in f:
+                continue
+            changed = (f.get("System.ChangedDate") or {}).get("newValue")
+            if not changed:
+                continue
+            when = datetime.fromisoformat(changed.replace("Z", "+00:00")).astimezone()
+            if day and when.date() != day:
+                continue
+            delta = num(f[F_DONE].get("newValue")) - num(f[F_DONE].get("oldValue"))
+            if not delta:
+                continue
+            comment = strip_html((f.get("System.History") or {}).get("newValue"))
+            entries.append((when, t, delta, comment))
+    entries.sort(key=lambda e: e[0])
+    return entries
+
+
+def day_status(total):
+    gap = DAILY - total
+    if abs(gap) < 1e-9:
+        return "✓ complete"
+    return f"{fmt(gap)}h left" if gap > 0 else f"{fmt(-gap)}h over"
+
+
+def cmd_day(args):
+    day = date.fromisoformat(args.date) if args.date else date.today()
+    entries = log_entries(my_tasks(current_sprint()), day)
+    print(f"Logged on {day.isoformat()}  ·  {USER}\n")
+    for when, t, delta, comment in entries:
+        print(f"  {when:%H:%M}  {fmt(delta):>5}h  {t['id']} {t['title']}"
+              + (f"\n                  “{comment}”" if comment else ""))
+    total = sum(e[2] for e in entries)
+    print(f"\n  Total: {fmt(total)} / {fmt(DAILY)}h  ({day_status(total)})")
+
+
+def cmd_summary(args):
+    sprint = get_sprint(args.sprint)
+    tasks = my_tasks(sprint)
+    if args.csv:
+        w = csv.writer(sys.stdout)
+        w.writerow(["date", "story_id", "story", "task_id", "task", "hours", "comment"])
+        for when, t, delta, comment in log_entries(tasks):
+            w.writerow([when.date().isoformat(), t["parent"] or "", t["parent_title"],
+                        t["id"], t["title"], f"{delta:g}", comment])
+        return
+
+    stories = {}
+    for t in tasks:
+        s = stories.setdefault(t["parent"], {"title": t["parent_title"] or "(no parent)",
+                                             "est": 0, "done": 0, "rem": 0, "tasks": []})
+        for k in ("est", "done", "rem"):
+            s[k] += t[k]
+        s["tasks"].append(t)
+
+    print(f"{sprint['name']}  ({sprint['start']} → {sprint['finish']})  ·  {USER}\n")
+    if not tasks:
+        print("No tasks assigned to you in this sprint.")
+        return
+    print(f"{'Story':>6}  {'Est':>5} {'Done':>5} {'Rem':>5}  Title")
+    for sid, s in stories.items():
+        print(f"{sid or '-':>6}  {fmt(s['est']):>5} {fmt(s['done']):>5} {fmt(s['rem']):>5}  {s['title']}")
+        for t in s["tasks"]:
+            print(f"{'':>6}  {'':>5} {fmt(t['done']):>5} {'':>5}    · {t['id']} {t['title']}")
+    est = sum(s["est"] for s in stories.values())
+    done = sum(s["done"] for s in stories.values())
+    rem = sum(s["rem"] for s in stories.values())
+    print(f"{'TOTAL':>6}  {fmt(est):>5} {fmt(done):>5} {fmt(rem):>5}")
+
+    if args.days:
+        by_day = {}
+        for when, t, delta, comment in log_entries(tasks):
+            by_day.setdefault(when.date(), []).append((t, delta, comment))
+        print("\nBy day")
+        for d, rows in sorted(by_day.items()):
+            total = sum(r[1] for r in rows)
+            print(f"\n  {d:%a %Y-%m-%d}   {fmt(total)}h  ({day_status(total)})")
+            for t, delta, comment in rows:
+                print(f"    {fmt(delta):>5}h  [{t['parent'] or '-'}] {t['title']}"
+                      + (f"\n             “{comment}”" if comment else ""))
+
+
+def cmd_stories(args):
+    sprint = current_sprint()
+    rows = wiql(
+        f"SELECT [{F_TYPE}],[{F_TITLE}],[{F_STATE}],[{F_PARENT}],[{F_EST}],[{F_ASSIGNED}],[{F_SP}],[{F_ACTIVITY}] "
+        f"FROM WorkItems WHERE [System.IterationPath] = '{sprint['path']}' "
+        f"AND [{F_STATE}] <> 'Removed' ORDER BY [System.Id]"
+    )
+    stories, children = [], {}
+    for r in rows:
+        f = r["fields"]
+        item = {"id": r["id"], "type": f.get(F_TYPE), "title": f.get(F_TITLE, ""),
+                "state": f.get(F_STATE), "assigned": assignee(f)}
+        if f.get(F_TYPE) in STORY_TYPES:
+            item["story_points"] = f.get(F_SP)
+            stories.append(item)
+        else:
+            item.update(est=num(f.get(F_EST)), activity=f.get(F_ACTIVITY) or "")
+            children.setdefault(f.get(F_PARENT), []).append(item)
+    for s in stories:
+        s["tasks"] = children.get(s["id"], [])
+    if args.json:
+        print(json.dumps({"sprint": sprint, "user": USER, "stories": stories}, indent=2, ensure_ascii=False))
+        return
+    print(f"{sprint['name']}  ({sprint['start']} → {sprint['finish']})\n")
+    for s in stories:
+        sp = f" · {fmt(s['story_points'])} SP" if s.get("story_points") else ""
+        print(f"{s['id']}  [{s['state']}{sp}]  {s['title']}")
+        for c in s["tasks"]:
+            me = " ← you" if c["assigned"].lower() == USER.lower() else ""
+            who = c["assigned"].split("@")[0]
+            print(f"        {c['id']}  {fmt(c['est']):>5}h  {c['type']:<8} {c['title']}  ({who}){me}")
+    print()
+
+
+def create_one(sprint, item, dry_run):
+    wtype = item.get("type", "Task")
+    hours = float(item["hours"])
+    activity = item.get("activity") or (DEV_ACTIVITY if wtype == "Task" else None)
+    fields = [f"{F_EST}={hours:g}", f"{F_REM}={hours:g}"]
+    if activity:
+        fields.append(f"{F_ACTIVITY}={activity}")
+    if activity == IDLE_ACTIVITY:
+        fields += [f"{F_DONE}=0", *idle_reason_fields()]
+    label = f"[{item['parent']}] {fmt(hours):>5}h  {wtype:<8} {activity or '-':<11} {item['title']}"
+    if dry_run:
+        print(f"  (dry-run) {label}")
+        return hours
+    args = ["boards", "work-item", "create", "--type", wtype, "--title", item["title"],
+            "--iteration", sprint["path"], "--area", AREA, "--assigned-to", USER, "--fields", *fields]
+    if item.get("description"):
+        args += ["--description", item["description"]]
+    created = az(*args)
+    az("boards", "work-item", "relation", "add", "--id", str(created["id"]),
+       "--relation-type", "parent", "--target-id", str(item["parent"]), project=False)
+    print(f"  ✓ {created['id']}  {label}")
+    return hours
+
+
+def cmd_create(args):
+    if args.from_file:
+        with open(args.from_file, encoding="utf-8") as fh:
+            items = json.load(fh)
+        if isinstance(items, dict):
+            items = items.get("tasks", [])
+    else:
+        if not (args.parent and args.title and args.hours is not None):
+            raise TlogError("create needs --from FILE, or --parent, --title and --hours")
+        items = [{"parent": args.parent, "title": args.title, "hours": args.hours,
+                  "type": args.type, "activity": args.activity, "description": args.desc}]
+    sprint = current_sprint()
+    print(f"{'Planning' if args.dry_run else 'Creating'} in {sprint['name']} for {USER}:")
+    total = sum(create_one(sprint, it, args.dry_run) for it in items)
+    print(f"  Total: {fmt(total)}h")
+
+
+def cmd_sprint(_args):
+    s = current_sprint()
+    print(f"{s['name']}  ({s['start']} → {s['finish']})\n{s['path']}")
+
+
+# ---------------------------------------------------------------- reminder
+
+def systemctl(*args, check=True):
+    res = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    if check and res.returncode != 0:
+        raise TlogError(res.stderr.strip() or f"systemctl {' '.join(args)} failed")
+    return res.stdout.strip()
+
+
+def notify(title, body, urgency="normal"):
+    subprocess.run(["notify-send", "-a", "tlog", "-u", urgency, "-i", "appointment-soon", title, body],
+                   check=False)
+
+
+def remind_start(args):
+    if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", args.time):
+        raise TlogError(f"Time must be HH:MM (24h), got '{args.time}'")
+    on_calendar = f"{args.days} *-*-* {args.time}:00"
+    check = subprocess.run(["systemd-analyze", "calendar", on_calendar], capture_output=True, text=True)
+    if check.returncode != 0:
+        raise TlogError(f"Invalid --days '{args.days}' (examples: Mon..Fri, Sun,Mon..Thu, Mon,Wed,Fri — ranges cannot wrap past Sun)")
+
+    env = "".join(f"Environment={k}={v}\n" for k, v in os.environ.items() if k.startswith("TLOG_"))
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    (UNIT_DIR / f"{REMIND_UNIT}.service").write_text(
+        "[Unit]\nDescription=tlog: remind me to log my daily hours\n\n"
+        f"[Service]\nType=oneshot\n{env}ExecStart={Path(__file__).resolve()} remind check\n")
+    (UNIT_DIR / f"{REMIND_UNIT}.timer").write_text(
+        "[Unit]\nDescription=tlog daily hours reminder\n\n"
+        f"[Timer]\nOnCalendar={on_calendar}\nPersistent=false\nAccuracySec=1min\n\n"
+        "[Install]\nWantedBy=timers.target\n")
+    systemctl("daemon-reload")
+    systemctl("enable", "--now", f"{REMIND_UNIT}.timer")
+    systemctl("restart", f"{REMIND_UNIT}.timer")
+    print(f"✓ Reminder on: {args.days} at {args.time} (only fires if you have < {fmt(DAILY)}h logged).")
+    remind_status(None)
+
+
+def remind_stop(_args):
+    existed = (UNIT_DIR / f"{REMIND_UNIT}.timer").exists()
+    systemctl("disable", "--now", f"{REMIND_UNIT}.timer", check=False)
+    for ext in ("timer", "service"):
+        (UNIT_DIR / f"{REMIND_UNIT}.{ext}").unlink(missing_ok=True)
+    systemctl("daemon-reload", check=False)
+    print("✓ Reminder off." if existed else "Reminder was not on.")
+
+
+def remind_status(_args):
+    timer = UNIT_DIR / f"{REMIND_UNIT}.timer"
+    if not timer.exists():
+        print("Reminder: off   (turn on with `tlog remind start [HH:MM]`)")
+        return
+    when = re.search(r"OnCalendar=(.*)", timer.read_text()).group(1)
+    active = systemctl("is-active", f"{REMIND_UNIT}.timer", check=False)
+    nxt = systemctl("show", f"{REMIND_UNIT}.timer", "-p", "NextElapseUSecRealtime", "--value", check=False)
+    print(f"Reminder: {'on' if active == 'active' else active}   schedule: {when}"
+          + (f"   next: {nxt}" if nxt else ""))
+
+
+def remind_check(_args):
+    try:
+        total = sum(e[2] for e in log_entries(my_tasks(current_sprint()), date.today()))
+    except TlogError as e:
+        notify("tlog: couldn't check your hours", str(e)[:200], "normal")
+        raise
+    if total + 1e-9 < DAILY:
+        notify(f"Log your hours: {fmt(total)} / {fmt(DAILY)}h today",
+               f"{fmt(DAILY - total)}h left to log.\nRun `tlog` to see your tasks, or `tlog day`.", "critical")
+    print(f"{date.today()}: {fmt(total)} / {fmt(DAILY)}h ({day_status(total)})")
+
+
+def remind_test(_args):
+    notify("tlog reminder test", f"This is how the daily reminder looks when you have < {fmt(DAILY)}h logged.")
+    print("Sent a test notification.")
+
+
+# ---------------------------------------------------------------- entry
+
+NUMBER = re.compile(r"-?\d+(\.\d+)?")
+
+
+def main(argv):
+    if not argv or argv[0] in ("ls", "list"):
+        return cmd_list(None)
+    if argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if argv[0] == "log":
+        argv = argv[1:]
+    commands = ("day", "create", "stories", "sprint", "summary", "remind")
+    if len(argv) >= 2 and NUMBER.fullmatch(argv[1]) and argv[0] not in commands:
+        return cmd_log(argv[0], float(argv[1]), " ".join(argv[2:]).strip())
+
+    p = argparse.ArgumentParser(prog="tlog", description="Azure DevOps sprint helper")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("day")
+    d.add_argument("date", nargs="?")
+    d.set_defaults(fn=cmd_day)
+    s = sub.add_parser("stories")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_stories)
+    c = sub.add_parser("create")
+    c.add_argument("--from", dest="from_file")
+    c.add_argument("--parent", type=int)
+    c.add_argument("--title")
+    c.add_argument("--hours", type=float)
+    c.add_argument("--type", default="Task")
+    c.add_argument("--activity")
+    c.add_argument("--desc")
+    c.add_argument("--dry-run", action="store_true")
+    c.set_defaults(fn=cmd_create)
+    sub.add_parser("sprint").set_defaults(fn=cmd_sprint)
+    sm = sub.add_parser("summary")
+    sm.add_argument("--sprint", help="'prev' or part of a sprint name (default: current)")
+    sm.add_argument("--days", action="store_true", help="add a day-by-day breakdown")
+    sm.add_argument("--csv", action="store_true", help="day/story/task rows as CSV")
+    sm.set_defaults(fn=cmd_summary)
+    r = sub.add_parser("remind").add_subparsers(dest="action", required=True)
+    rs = r.add_parser("start")
+    rs.add_argument("time", nargs="?", default="16:00")
+    rs.add_argument("--days", default=WORKDAYS)
+    rs.set_defaults(fn=remind_start)
+    r.add_parser("stop").set_defaults(fn=remind_stop)
+    r.add_parser("status").set_defaults(fn=remind_status)
+    r.add_parser("check").set_defaults(fn=remind_check)
+    r.add_parser("test").set_defaults(fn=remind_test)
+    a = p.parse_args(argv)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when piped into head/less
+    try:
+        main(sys.argv[1:])
+    except TlogError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
